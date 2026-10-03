@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Кэш префикса у провайдера
 
     python 3_prefix_cache.py
@@ -7,13 +6,14 @@
 в конце. Провайдер берёт из кэша совпадающее начало запроса. Смотрите,
 в каком варианте это срабатывает
 """
+
 from __future__ import annotations
 
 import datetime
 import time
 
 from desk.config import DATA
-from desk.llm import LLM
+from desk.llm import LLM, LLMError
 
 
 def system_variant(rules: str, stamp: str, where: str) -> str:
@@ -34,24 +34,40 @@ def main() -> None:
     )
     print("| где метка | попытка | входных без кэша | из кэша | ответ |")
     print("|---|---|---|---|---|")
-    for where in ("start", "end"):
-        for attempt in range(1, 4):
-            stamp = "Текущее время: %s" % datetime.datetime.now().isoformat(
-                timespec="seconds"
-            )
-            reply = llm.chat(
-                [
-                    {"role": "system", "content": system_variant(rules, stamp, where)},
-                    {"role": "user", "content": question},
-                ],
-                max_tokens=10,
-            )
-            u = reply.usage
-            print(
-                "| %s | %d | %d | %d | %s |"
-                % (where, attempt, u.input_tokens, u.cache_read_tokens, reply.text)
-            )
-            time.sleep(1.1)  # чтобы метка времени сменилась
+    try:
+        for where in ("start", "end"):
+            for attempt in range(1, 4):
+                stamp = "Текущее время: %s" % datetime.datetime.now().isoformat(
+                    timespec="seconds"
+                )
+                try:
+                    reply = llm.chat(
+                        [
+                            {
+                                "role": "system",
+                                "content": system_variant(rules, stamp, where),
+                            },
+                            {"role": "user", "content": question},
+                        ],
+                        max_tokens=10,
+                    )
+                except LLMError as error:
+                    print(f"| {where} | {attempt} | — | — | {error} |")
+                else:
+                    u = reply.usage
+                    print(
+                        "| %s | %d | %d | %d | %s |"
+                        % (
+                            where,
+                            attempt,
+                            u.input_tokens,
+                            u.cache_read_tokens,
+                            reply.text,
+                        )
+                    )
+                time.sleep(1.1)  # метка должна обновиться
+    finally:
+        llm.close()
     total = llm.total()
     print("\nпотрачено взвешенных токенов: %.0f" % total.weighted)
 

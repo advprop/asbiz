@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Схемы ответов
 
 Из схемы строится и проверка ответа модели, и описание формата в постановке
@@ -7,11 +6,20 @@
 from __future__ import annotations
 
 import re
-from typing import List, Literal, Optional, Type
+from enum import StrEnum
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
-Category = Literal["платежи", "возвраты", "доступ", "тарифы", "интеграция", "другое"]
+
+class Category(StrEnum):
+    payments = "платежи"
+    refunds = "возвраты"
+    access = "доступ"
+    tariffs = "тарифы"
+    integration = "интеграция"
+    other = "другое"
+
+
 PAYMENT_ID = re.compile(r"^P-\d{5}$")
 
 
@@ -34,20 +42,20 @@ class Ticket(BaseModel):
         min_length=1,
         description="дословный фрагмент обращения, на котором основано решение",
     )
-    payment_ids: List[str] = Field(
+    payment_ids: list[str] = Field(
         default_factory=list,
         validate_default=True,
         description="все идентификаторы платежей вида P-12345",
     )
-    amount: Optional[int] = Field(
+    amount: int | None = Field(
         None, ge=0, description="сумма операции в рублях или null"
     )
 
     @field_validator("payment_ids")
     @classmethod
     def ids_look_right_and_come_from_text(
-        cls, ids: List[str], info: ValidationInfo
-    ) -> List[str]:
+        cls, ids: list[str], info: ValidationInfo
+    ) -> list[str]:
         """Номера подходят под шаблон, есть в тексте, и из текста взяты все"""
         source = (info.context or {}).get("source")
         for pid in ids:
@@ -75,10 +83,14 @@ class Ticket(BaseModel):
         return quote
 
 
-def describe(schema: Type[BaseModel]) -> str:
+def describe(schema: type[BaseModel]) -> str:
     """Описание формата для постановки: поле, тип и пояснение"""
     lines = []
     for name, f in schema.model_fields.items():
-        kind = str(f.annotation).replace("typing.", "")
+        kind = (
+            " | ".join(repr(item.value) for item in Category)
+            if f.annotation is Category
+            else str(f.annotation)
+        )
         lines.append('  "%s": %s  // %s' % (name, kind, f.description or ""))
     return "{\n" + ",\n".join(lines) + "\n}"

@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
 """Семинар 1. Потоковая выдача: разбор событий и время до первого токена. Сеть не нужна"""
+
 import asyncio
 
 import httpx
@@ -7,7 +7,23 @@ import pytest
 
 from desk.config import Settings
 from desk.llm import LLM, LLMError, Usage
-from desk.stream import collect, iter_sse
+from desk.stream import LineBuffer, collect, iter_sse
+
+
+def test_line_buffer_bounds_unterminated_stream():
+    buffer = LineBuffer(5)
+    assert buffer.feed(b"ab") == []
+    assert buffer.feed(b"c\n") == ["abc"]
+    with pytest.raises(LLMError):
+        buffer.feed(b"xyz")
+
+
+def test_line_buffer_preserves_split_utf8():
+    buffer = LineBuffer(10)
+    encoded = "ёж\n".encode()
+    assert buffer.feed(encoded[:1]) == []
+    assert buffer.feed(encoded[1:]) == ["ёж"]
+
 
 SSE = """event: message_start
 data: {"type": "message_start", "message": {"id": "msg_1", "usage": {"input_tokens": 25, "output_tokens": 1}}}
@@ -37,25 +53,51 @@ data: {"type": "message_stop"}
 
 
 def usage_from(u, latency, retries):
-    return Usage(int(u.get("input_tokens", 0)), int(u.get("output_tokens", 0)), 0, 0, latency,
-                 calls=1, retries=retries)
+    return Usage(
+        int(u.get("input_tokens", 0)),
+        int(u.get("output_tokens", 0)),
+        0,
+        0,
+        latency,
+        calls=1,
+        retries=retries,
+    )
 
 
 def test_iter_sse_basic():
     events = list(iter_sse(SSE.splitlines()))
-    assert [name for name, _ in events][:3] == ["message_start", "content_block_start", "ping"]
+    assert [name for name, _ in events][:3] == [
+        "message_start",
+        "content_block_start",
+        "ping",
+    ]
     assert events[3][1]["delta"]["text"] == "пла" and len(events) == 8
 
 
 def test_iter_sse_edge_cases():
-    lines = [": комментарий", "event: x", "data: {\"a\":", "data: 1}", "", "data: {\"b\": 2}"]
-    assert list(iter_sse(lines)) == [("x", {"a": 1}), ("message", {"b": 2})]   # склейка и хвост
-    assert list(iter_sse(["event:y", "data:{\"c\":3}", ""])) == [("y", {"c": 3})]  # без пробела
-    assert list(iter_sse(["data: {\"d\": 4}\r", "\r"])) == [("message", {"d": 4})]  # переводы \r\n
+    lines = [
+        ": комментарий",
+        "event: x",
+        'data: {"a":',
+        "data: 1}",
+        "",
+        'data: {"b": 2}',
+    ]
+    assert list(iter_sse(lines)) == [
+        ("x", {"a": 1}),
+        ("message", {"b": 2}),
+    ]  # склейка и хвост
+    assert list(iter_sse(["event:y", 'data:{"c":3}', ""])) == [
+        ("y", {"c": 3})
+    ]  # без пробела
+    assert list(iter_sse(['data: {"d": 4}\r', "\r"])) == [
+        ("message", {"d": 4})
+    ]  # переводы \r\n
 
 
 class Clock:
     """Часы, которые сдвигаются на 0,1 с при каждом обращении"""
+
     def __init__(self):
         self.t = 0.0
 
@@ -67,33 +109,44 @@ class Clock:
 def test_collect_text_usage_and_ttft():
     res = collect(iter_sse(SSE.splitlines()), Clock(), 0.0, usage_from)
     assert res.text == "платежи" and res.stop_reason == "end_turn"
-    assert (res.usage.input_tokens, res.usage.output_tokens) == (25, 3)   # выход из message_delta
+    assert (res.usage.input_tokens, res.usage.output_tokens) == (
+        25,
+        3,
+    )  # выход из message_delta
     assert res.ttft_s == pytest.approx(0.1) and res.total_s == pytest.approx(0.2)
     assert not res.truncated
 
 
 def test_collect_counts_thinking_and_waits_for_text():
-    lines = SSE.replace('"type": "text_delta", "text": "пла"',
-                        '"type": "thinking_delta", "thinking": "рассуждаю"').splitlines()
+    lines = SSE.replace(
+        '"type": "text_delta", "text": "пла"',
+        '"type": "thinking_delta", "thinking": "рассуждаю"',
+    ).splitlines()
     res = collect(iter_sse(lines), Clock(), 0.0, usage_from)
     assert res.text == "тежи" and res.thinking_chars == len("рассуждаю")
 
 
 def test_collect_without_text_and_truncated():
-    lines = [l for l in SSE.splitlines() if "text_delta" not in l]
-    lines = [l.replace("end_turn", "max_tokens") for l in lines]
+    lines = [line for line in SSE.splitlines() if "text_delta" not in line]
+    lines = [line.replace("end_turn", "max_tokens") for line in lines]
     res = collect(iter_sse(lines), Clock(), 0.0, usage_from)
     assert res.text == "" and res.ttft_s is None and res.truncated
 
 
 def test_error_event_stops_collection():
-    lines = ["event: error", 'data: {"type": "error", "error": {"type": "overloaded_error", "message": "занято"}}', ""]
+    lines = [
+        "event: error",
+        'data: {"type": "error", "error": {"type": "overloaded_error", "message": "занято"}}',
+        "",
+    ]
     with pytest.raises(LLMError):
         collect(iter_sse(lines), Clock(), 0.0, usage_from)
 
 
 def sse_response(request):
-    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=SSE.encode("utf-8"))
+    return httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, content=SSE.encode("utf-8")
+    )
 
 
 def test_stream_through_client_and_retry_before_first_byte():
@@ -104,19 +157,95 @@ def test_stream_through_client_and_retry_before_first_byte():
         return httpx.Response(529) if len(seen) == 1 else sse_response(request)
 
     sleeps = []
-    llm = LLM(Settings("https://gw.example", "key"), transport=httpx.MockTransport(handler),
-              sleep=sleeps.append, cache=False)
+    llm = LLM(
+        Settings("https://gw.example", "key"),
+        transport=httpx.MockTransport(handler),
+        sleep=sleeps.append,
+        cache=False,
+    )
     res = llm.stream([{"role": "user", "content": "x"}], max_tokens=16)
     import json
+
     assert json.loads(seen[-1].content)["stream"] is True
     assert res.text == "платежи" and res.usage.retries == 1 and len(sleeps) == 1
     assert llm.total().calls == 1 and res.ttft_s is not None
+
+
+def test_sync_stream_does_not_retry_after_partial_response():
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"event: message_start\ndata: {}\n\n"
+            raise httpx.ReadError("connection closed")
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, stream=Broken())
+
+    llm = LLM(
+        Settings("https://gw.example", "key"),
+        transport=httpx.MockTransport(handler),
+        cache=False,
+    )
+    with pytest.raises(LLMError, match="поток прерван"):
+        llm.stream([{"role": "user", "content": "x"}])
+    assert len(calls) == 1
+    llm.close()
 
 
 def test_async_stream():
     async def handler(request):
         return sse_response(request)
 
-    llm = LLM(Settings("https://gw.example", "key"), async_transport=httpx.MockTransport(handler), cache=False)
+    llm = LLM(
+        Settings("https://gw.example", "key"),
+        async_transport=httpx.MockTransport(handler),
+        cache=False,
+    )
     res = asyncio.run(llm.astream([{"role": "user", "content": "x"}]))
     assert res.text == "платежи" and 0 <= res.ttft_s <= res.total_s
+
+
+def test_async_stream_has_total_timeout_and_size_limit():
+    from desk.llm import MAX_STREAM_BYTES
+
+    class Slow(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.01)
+                yield b": ping\n\n"
+
+    async def check():
+        cfg = Settings("https://gw.example", "key", timeout_s=0.02)
+        slow = LLM(
+            cfg,
+            async_transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, stream=Slow())
+            ),
+            cache=False,
+        )
+        try:
+            with pytest.raises(LLMError, match="время потока"):
+                await slow.astream([{"role": "user", "content": "x"}])
+        finally:
+            await slow.aclose()
+            slow.close()
+
+        large = LLM(
+            cfg,
+            async_transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    200, content=b"x" * (MAX_STREAM_BYTES + 1) + b"\n"
+                )
+            ),
+            cache=False,
+        )
+        try:
+            with pytest.raises(LLMError, match="размер"):
+                await large.astream([{"role": "user", "content": "x"}])
+        finally:
+            await large.aclose()
+            large.close()
+
+    asyncio.run(check())

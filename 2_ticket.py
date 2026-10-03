@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Разбор своего обращения или обращений из набора
 
     python 2_ticket.py "текст обращения"
@@ -33,9 +32,20 @@ def main(args: list) -> None:
         rows = [by_id[a] for a in args]
     else:
         rows = [{"id": "ваше", "text": " ".join(args), "gold": None}]
-    answers = asyncio.run(atriage_many(LLM(), [r["text"] for r in rows]))
+    llm = LLM()
+
+    async def run() -> list[Ticket | Exception]:
+        try:
+            return await atriage_many(llm, [r["text"] for r in rows])
+        finally:
+            await llm.aclose()
+
+    try:
+        answers = asyncio.run(run())
+    finally:
+        llm.close()
     same = 0
-    for r, t in zip(rows, answers):
+    for r, t in zip(rows, answers, strict=True):
         if not isinstance(t, Ticket):
             print(r["id"], "не прошло проверку:", t)
             continue

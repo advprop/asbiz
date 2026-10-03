@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Клиент к модели
 
 Все вызовы модели в проекте идут через класс LLM. Он собирает запрос
@@ -10,25 +9,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import re
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import httpx
 
 from .config import Settings
 from .config import settings as load_settings
 
-if TYPE_CHECKING:
-    from .stream import StreamResult
-
-# После этих кодов запрос повторяем. 529 значит, что провайдер перегружен
+# Повторяем временные ошибки шлюза. Код 529 означает перегрузку.
 RETRY_STATUS = {408, 429, 500, 502, 503, 504, 529}
 ANTHROPIC_VERSION = "2023-06-01"
 WINDOW_S = 61.0
+MAX_STREAM_BYTES = 1_000_000
+MAX_RESPONSE_BYTES = 1_000_000
+READ_CHUNK_BYTES = 64_000
 _THINK = re.compile(r"<think>.*?</think>", re.S)
 
 
@@ -38,7 +38,7 @@ class RateLimit:
     def __init__(self, rpm: int, clock: Callable[[], float] = time.monotonic):
         self.rpm = rpm
         self.clock = clock
-        self.sent: Deque[float] = deque()
+        self.sent: deque[float] = deque()
 
     def reserve(self) -> float:
         """Занимает место для запроса и говорит, сколько секунд ждать до отправки"""
@@ -51,6 +51,8 @@ class RateLimit:
         if len(self.sent) >= self.rpm:
             at = max(now, self.sent[-self.rpm] + WINDOW_S)
         self.sent.append(at)
+        if len(self.sent) > self.rpm:
+            self.sent.popleft()
         return at - now
 
 
@@ -98,7 +100,7 @@ class ToolCall:
 
     id: str
     name: str
-    input: Any  # аргументы, обычно словарь
+    input: object  # аргументы, обычно словарь
 
     @property
     def arguments(self) -> str:
@@ -113,18 +115,18 @@ class Reply:
     """Ответ модели"""
 
     text: str
-    tool_calls: List[ToolCall]
+    tool_calls: list[ToolCall]
     usage: Usage
     stop_reason: str = "end_turn"
-    content: List[Dict[str, Any]] = field(default_factory=list)  # блоки как есть
-    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+    content: list[dict[str, object]] = field(default_factory=list)  # блоки как есть
+    raw: dict[str, object] = field(default_factory=dict, repr=False)
 
     @property
     def truncated(self) -> bool:
         """Ответ оборван по max_tokens"""
         return self.stop_reason == "max_tokens"
 
-    def as_message(self) -> Dict[str, Any]:
+    def as_message(self) -> dict[str, object]:
         """Ответ как сообщение для истории диалога"""
         if self.content:
             return {"role": "assistant", "content": self.content}
@@ -132,15 +134,15 @@ class Reply:
 
 
 def tool_result(
-    call: ToolCall, observation: Any, is_error: bool = False
-) -> Dict[str, Any]:
+    call: ToolCall, observation: object, is_error: bool = False
+) -> dict[str, object]:
     """Результат инструмента для следующего запроса"""
     content = (
         observation
         if isinstance(observation, str)
         else json.dumps(observation, ensure_ascii=False)
     )
-    block: Dict[str, Any] = {
+    block: dict[str, object] = {
         "type": "tool_result",
         "tool_use_id": call.id,
         "content": content,
@@ -150,7 +152,9 @@ def tool_result(
     return block
 
 
-def split_system(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+def split_system(
+    messages: list[dict[str, object]],
+) -> tuple[str, list[dict[str, object]]]:
     """Отделяет системную постановку от остальных сообщений"""
     system, rest = [], []
     for m in messages:
@@ -170,7 +174,7 @@ def backoff_delay(
     *,
     base: float = 0.5,
     cap: float = 20.0,
-    retry_after: Optional[float] = None,
+    retry_after: float | None = None,
     rnd: Callable[[], float] = random.random,
 ) -> float:
     """Пауза перед повтором
@@ -184,29 +188,29 @@ def backoff_delay(
     return min(cap, base * (2**attempt)) * (0.5 + rnd())
 
 
-def should_retry(status: Optional[int], exc: Optional[BaseException]) -> bool:
+def should_retry(status: int | None, exc: BaseException | None) -> bool:
     """Поможет ли повтор после такой ошибки"""
     if exc is not None:
         return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
     return status in RETRY_STATUS
 
 
-def cache_key(payload: Dict[str, Any]) -> str:
+def cache_key(payload: dict[str, object]) -> str:
     """Ключ кэша: хэш запроса. Порядок полей на него не влияет"""
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
 
 class LLM:
-    """Клиент к модели через шлюз курса"""
+    """Клиент шлюза. После работы закройте соединения через aclose и close."""
 
     def __init__(
         self,
-        cfg: Optional[Settings] = None,
+        cfg: Settings | None = None,
         *,
         max_retries: int = 4,
-        transport: Optional[httpx.BaseTransport] = None,
-        async_transport: Optional[httpx.AsyncBaseTransport] = None,
+        transport: httpx.BaseTransport | None = None,
+        async_transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         cache: bool = True,
         clock: Callable[[], float] = time.monotonic,
@@ -217,7 +221,8 @@ class LLM:
         self.max_retries = max_retries
         self.sleep = sleep
         self.cache = cache and self.cfg.cache_dir is not None
-        self.ledger: List[Usage] = []
+        self.ledger: deque[Usage] = deque(maxlen=128)
+        self._sum = Usage()
         self.limit = RateLimit(self.cfg.rpm, clock)
         headers = {
             "anthropic-version": ANTHROPIC_VERSION,
@@ -235,22 +240,36 @@ class LLM:
         )
         self._client = httpx.Client(transport=transport, **self._common)
         self._async_transport = async_transport
-        self._aclient: Optional[httpx.AsyncClient] = None
-        self._aloop: Any = None
+        self._aclient: httpx.AsyncClient | None = None
+        self._aloop: object = None
 
-    def _async_client(self) -> httpx.AsyncClient:
+    async def _async_client(self) -> httpx.AsyncClient:
         """Асинхронный клиент для текущего цикла событий"""
         import asyncio
 
         loop = asyncio.get_running_loop()
-        if self._aclient is None or self._aloop is not loop:
+        if self._aclient is not None and self._aloop is not loop:
+            old = self._aclient
+            self._aclient = None
+            self._aloop = None
+            await old.aclose()
+        if self._aclient is None:
             self._aclient = httpx.AsyncClient(
                 transport=self._async_transport, **self._common
             )
             self._aloop = loop
         return self._aclient
 
-    def variant(self, **changes: Any) -> "LLM":
+    def close(self) -> None:
+        self._client.close()
+
+    async def aclose(self) -> None:
+        if self._aclient is not None:
+            await self._aclient.aclose()
+            self._aclient = None
+            self._aloop = None
+
+    def variant(self, **changes: object) -> "LLM":
         """Копия клиента с другими настройками, например с другой моделью"""
         if "base_url" in changes or "api_key" in changes:
             raise ValueError(
@@ -259,28 +278,29 @@ class LLM:
         other = LLM.__new__(LLM)
         other.__dict__.update(self.__dict__)
         other.cfg = replace(self.cfg, **changes)
-        other.ledger = []
+        other.ledger = deque(maxlen=128)
+        other._sum = Usage()
+        other._aclient = None
+        other._aloop = None
         return other
-
-    # Запрос и ответ
 
     def payload(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, object]],
         *,
-        tools: Optional[List[dict]] = None,
+        tools: list[dict] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 512,
-        tool_choice: Optional[str] = None,
+        tool_choice: str | None = None,
         stream: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, object]:
         """Тело запроса к модели
 
         Если в добавке из настроек включено рассуждение, температуру
         убираем: с рассуждением провайдер её не принимает
         """
         system, dialog = split_system(messages)
-        body: Dict[str, Any] = {
+        body: dict[str, object] = {
             "model": self.cfg.model,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -299,7 +319,7 @@ class LLM:
             body.pop("temperature", None)
         return body
 
-    def usage_from(self, u: Dict[str, Any], latency_s: float, retries: int) -> Usage:
+    def usage_from(self, u: dict[str, object], latency_s: float, retries: int) -> Usage:
         """Счёт вызова по полю usage: токены, деньги, взвешенные токены"""
         cfg = self.cfg
         inp = int(u.get("input_tokens") or 0)
@@ -313,29 +333,34 @@ class LLM:
             inp, out, read, write, latency_s, cost, weighted, calls=1, retries=retries
         )
 
-    def parse(self, data: Dict[str, Any], latency_s: float, retries: int) -> Reply:
+    def parse(self, data: dict[str, object], latency_s: float, retries: int) -> Reply:
         """Разбирает ответ модели: текст, вызовы инструментов, счёт"""
-        blocks = data.get("content") or []
+        if not isinstance(data, dict) or not isinstance(data.get("content"), list):
+            raise LLMError("неверный формат ответа шлюза")
+        blocks = data["content"]
+        if not all(isinstance(b, dict) for b in blocks):
+            raise LLMError("неверный формат блоков ответа")
         text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         calls = [
             ToolCall(b.get("id") or "toolu_%d" % i, b["name"], b.get("input") or {})
             for i, b in enumerate(blocks)
             if b.get("type") == "tool_use"
         ]
-        usage = self.usage_from(data.get("usage") or {}, latency_s, retries)
+        try:
+            usage = self.usage_from(data.get("usage") or {}, latency_s, retries)
+        except (TypeError, ValueError) as e:
+            raise LLMError("неверный формат usage") from e
         text = _THINK.sub("", text).strip()
         return Reply(
             text, calls, usage, data.get("stop_reason") or "end_turn", blocks, data
         )
 
-    # Повторы
-
     def pause_or_raise(
         self,
         attempt: int,
-        status: Optional[int],
-        exc: Optional[BaseException],
-        resp: Optional[httpx.Response],
+        status: int | None,
+        exc: BaseException | None,
+        resp: httpx.Response | None,
     ) -> float:
         """Что делать после неудачной попытки
 
@@ -350,45 +375,91 @@ class LLM:
                 "нет ответа после %d попыток (последний ответ %s: %s)"
                 % (self.max_retries + 1, status, detail)
             )
+        if status == 429:
+            return retry_after(resp) or WINDOW_S
         return backoff_delay(attempt, retry_after=retry_after(resp))
 
     def _post(
-        self, path: str, body: Dict[str, Any]
-    ) -> Tuple[Optional[int], Optional[BaseException], Optional[httpx.Response]]:
+        self, path: str, body: dict[str, object]
+    ) -> tuple[int | None, BaseException | None, httpx.Response | None]:
         """Отправка запроса. Возвращает код ответа, ошибку сети и сам ответ"""
         wait = self.limit.reserve()
         if wait:
             self.sleep(wait)
         try:
-            resp = self._client.post(path, json=body)
-            return resp.status_code, None, resp
+            started = time.monotonic()
+            with self._client.stream("POST", path, json=body) as response:
+                parts = []
+                size = 0
+                for chunk in response.iter_bytes(chunk_size=READ_CHUNK_BYTES):
+                    if time.monotonic() - started > 2 * self.cfg.timeout_s:
+                        raise LLMError("общее время запроса истекло")
+                    size += len(chunk)
+                    if size > MAX_RESPONSE_BYTES:
+                        raise LLMError("ответ шлюза превысил допустимый размер")
+                    parts.append(chunk)
+                resp = httpx.Response(
+                    response.status_code,
+                    headers=response.headers,
+                    content=b"".join(parts),
+                    request=response.request,
+                )
+                return resp.status_code, None, resp
         except httpx.HTTPError as e:
             return None, e, None
 
     async def _apost(
-        self, path: str, body: Dict[str, Any]
-    ) -> Tuple[Optional[int], Optional[BaseException], Optional[httpx.Response]]:
-        """То же, что _post, но асинхронно"""
+        self, path: str, body: dict[str, object]
+    ) -> tuple[int | None, BaseException | None, httpx.Response | None]:
+        """Отправляет запрос с общим пределом времени."""
         import asyncio
 
         wait = self.limit.reserve()
         if wait:
             await asyncio.sleep(wait)
         try:
-            resp = await self._async_client().post(path, json=body)
-            return resp.status_code, None, resp
+            async with asyncio.timeout(2 * self.cfg.timeout_s):
+                client = await self._async_client()
+                async with client.stream("POST", path, json=body) as response:
+                    parts = []
+                    size = 0
+                    async for chunk in response.aiter_bytes(
+                        chunk_size=READ_CHUNK_BYTES
+                    ):
+                        size += len(chunk)
+                        if size > MAX_RESPONSE_BYTES:
+                            raise LLMError("ответ шлюза превысил допустимый размер")
+                        parts.append(chunk)
+                    resp = httpx.Response(
+                        response.status_code,
+                        headers=response.headers,
+                        content=b"".join(parts),
+                        request=response.request,
+                    )
+                    return resp.status_code, None, resp
+        except TimeoutError:
+            return None, httpx.ReadTimeout("общее время запроса истекло"), None
         except httpx.HTTPError as e:
             return None, e, None
 
-    def _record(self, body: Dict[str, Any], reply: Reply) -> Reply:
+    def _record(self, body: dict[str, object], reply: Reply) -> Reply:
         """Записывает вызов в журнал и в кэш"""
-        self.ledger.append(reply.usage)
+        self._add_usage(reply.usage)
         self._cache_put(body, reply)
         return reply
 
-    # Обычный вызов
+    def _reply(self, resp: httpx.Response, latency_s: float, retries: int) -> Reply:
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise LLMError("ответ шлюза не содержит JSON") from e
+        return self.parse(data, latency_s, retries)
 
-    def chat(self, messages: List[Dict[str, Any]], **kw: Any) -> Reply:
+    def _add_usage(self, usage: Usage) -> None:
+        self.ledger.append(usage)
+        self._sum = self._sum + usage
+
+    def chat(self, messages: list[dict[str, object]], **kw: object) -> Reply:
         """Отправляет запрос модели и возвращает ответ
 
         Если такой запрос уже был, берёт ответ из кэша. При сбоях повторяет
@@ -402,15 +473,13 @@ class LLM:
         while True:
             status, exc, resp = self._post("/v1/messages", body)
             if status == 200:
-                reply = self.parse(resp.json(), time.perf_counter() - started, attempt)
+                reply = self._reply(resp, time.perf_counter() - started, attempt)
                 return self._record(body, reply)
             self.sleep(self.pause_or_raise(attempt, status, exc, resp))
             attempt += 1
 
-    # Асинхронный вызов
-
-    async def achat(self, messages: List[Dict[str, Any]], **kw: Any) -> Reply:
-        """То же, что chat, но асинхронно"""
+    async def achat(self, messages: list[dict[str, object]], **kw: object) -> Reply:
+        """Отправляет запрос и повторяет временные ошибки шлюза."""
         import asyncio
 
         body = self.payload(messages, **kw)
@@ -422,53 +491,83 @@ class LLM:
         while True:
             status, exc, resp = await self._apost("/v1/messages", body)
             if status == 200:
-                reply = self.parse(resp.json(), time.perf_counter() - started, attempt)
+                reply = self._reply(resp, time.perf_counter() - started, attempt)
                 return self._record(body, reply)
             await asyncio.sleep(self.pause_or_raise(attempt, status, exc, resp))
             attempt += 1
 
-    # Потоковая выдача
-
-    def stream(self, messages: List[Dict[str, Any]], **kw: Any) -> "StreamResult":
+    def stream(self, messages: list[dict[str, object]], **kw: object) -> "StreamResult":  # noqa: F821
         """Запрос с потоковой выдачей
 
         Повторяем, только пока ответ не начал приходить: оборванный
         посередине поток уже оплачен
         """
-        from .stream import collect, iter_sse
+        from .stream import LineBuffer, collect, iter_sse
 
         body = self.payload(messages, stream=True, **kw)
-        started = time.perf_counter()
         attempt = 0
         while True:
+            wait = self.limit.reserve()
+            if wait:
+                self.sleep(wait)
+            if attempt == 0:
+                started = time.perf_counter()
             status, exc, resp = None, None, None
             try:
+                stream_started = time.monotonic()
                 with self._client.stream("POST", "/v1/messages", json=body) as r:
                     status = r.status_code
                     if status == 200:
+                        buffer = LineBuffer(MAX_STREAM_BYTES)
+
+                        def lines(started_at=stream_started, reader=buffer):
+                            for chunk in r.iter_bytes(chunk_size=READ_CHUNK_BYTES):
+                                if (
+                                    time.monotonic() - started_at
+                                    > 2 * self.cfg.timeout_s
+                                ):
+                                    raise LLMError("общее время потока истекло")
+                                yield from reader.feed(chunk)
+                            yield from reader.finish()
+
                         result = collect(
-                            iter_sse(r.iter_lines()),
+                            iter_sse(lines()),
                             time.perf_counter,
                             started,
                             self.usage_from,
                             attempt,
                         )
-                        self.ledger.append(result.usage)
+                        self._add_usage(result.usage)
                         return result
-                    r.read()
-                    resp = r
+                    parts = []
+                    size = 0
+                    for chunk in r.iter_bytes(chunk_size=READ_CHUNK_BYTES):
+                        if time.monotonic() - stream_started > 2 * self.cfg.timeout_s:
+                            raise LLMError("общее время потока истекло")
+                        size += len(chunk)
+                        if size > MAX_RESPONSE_BYTES:
+                            raise LLMError("ответ шлюза превысил допустимый размер")
+                        parts.append(chunk)
+                    resp = httpx.Response(
+                        r.status_code,
+                        headers=r.headers,
+                        content=b"".join(parts),
+                        request=r.request,
+                    )
             except httpx.HTTPError as e:
+                if status == 200:
+                    raise LLMError("поток прерван после начала ответа") from e
                 exc = e
             self.sleep(self.pause_or_raise(attempt, status, exc, resp))
             attempt += 1
 
     async def astream(
-        self, messages: List[Dict[str, Any]], **kw: Any
-    ) -> "StreamResult":
-        """То же, что stream, но асинхронно"""
+        self, messages: list[dict[str, object]], **kw: object
+    ) -> "StreamResult":  # noqa: F821
+        """Читает поток с пределом времени и размера ответа."""
         import asyncio
 
-        from .stream import collect, iter_sse
+        from .stream import LineBuffer, collect, iter_sse
 
         body = self.payload(messages, stream=True, **kw)
         attempt = 0
@@ -480,48 +579,63 @@ class LLM:
                 started = time.perf_counter()
             status, exc, resp = None, None, None
             try:
-                async with self._async_client().stream(
-                    "POST", "/v1/messages", json=body
-                ) as r:
-                    status = r.status_code
-                    if status == 200:
-                        stamped = [
-                            (time.perf_counter(), line)
-                            async for line in r.aiter_lines()
-                        ]
-                        now = {"t": started}
+                async with asyncio.timeout(2 * self.cfg.timeout_s):
+                    client = await self._async_client()
+                    async with client.stream("POST", "/v1/messages", json=body) as r:
+                        status = r.status_code
+                        if status == 200:
+                            stamped = []
+                            buffer = LineBuffer(MAX_STREAM_BYTES)
+                            async for chunk in r.aiter_bytes(
+                                chunk_size=READ_CHUNK_BYTES
+                            ):
+                                for line in buffer.feed(chunk):
+                                    stamped.append((time.perf_counter(), line))
+                            for line in buffer.finish():
+                                stamped.append((time.perf_counter(), line))
+                            now = {"t": started}
 
-                        def replay():
-                            for moment, line in stamped:
-                                now["t"] = moment
-                                yield line
+                            def replay(events=stamped, clock=now):
+                                for moment, line in events:
+                                    clock["t"] = moment
+                                    yield line
 
-                        result = collect(
-                            iter_sse(replay()),
-                            lambda: now["t"],
-                            started,
-                            self.usage_from,
-                            attempt,
+                            result = collect(
+                                iter_sse(replay()),
+                                lambda clock=now: clock["t"],
+                                started,
+                                self.usage_from,
+                                attempt,
+                            )
+                            self._add_usage(result.usage)
+                            return result
+                        parts = []
+                        size = 0
+                        async for chunk in r.aiter_bytes(chunk_size=READ_CHUNK_BYTES):
+                            size += len(chunk)
+                            if size > MAX_RESPONSE_BYTES:
+                                raise LLMError("ответ шлюза превысил допустимый размер")
+                            parts.append(chunk)
+                        resp = httpx.Response(
+                            r.status_code,
+                            headers=r.headers,
+                            content=b"".join(parts),
+                            request=r.request,
                         )
-                        self.ledger.append(result.usage)
-                        return result
-                    await r.aread()
-                    resp = r
+            except TimeoutError as e:
+                raise LLMError("общее время потока истекло") from e
             except httpx.HTTPError as e:
+                if status == 200:
+                    raise LLMError("поток прерван после начала ответа") from e
                 exc = e
             await asyncio.sleep(self.pause_or_raise(attempt, status, exc, resp))
             attempt += 1
 
-    # Учёт и кэш
-
     def total(self) -> Usage:
         """Сумма по всем вызовам"""
-        out = Usage()
-        for u in self.ledger:
-            out = out + u
-        return out
+        return replace(self._sum)
 
-    def _cache_get(self, body: Dict[str, Any]) -> Optional[Reply]:
+    def _cache_get(self, body: dict[str, object]) -> Reply | None:
         if not self.cache or body.get("temperature", 0) != 0:
             return None
         path = self.cfg.cache_dir / (cache_key(body) + ".json")
@@ -529,10 +643,10 @@ class LLM:
             return None
         reply = self.parse(json.loads(path.read_text(encoding="utf-8")), 0.0, 0)
         reply.usage = replace(reply.usage, cost=0.0, weighted=0.0, cached=1)
-        self.ledger.append(reply.usage)
+        self._add_usage(reply.usage)
         return reply
 
-    def _cache_put(self, body: Dict[str, Any], reply: Reply) -> None:
+    def _cache_put(self, body: dict[str, object], reply: Reply) -> None:
         if not self.cache or body.get("temperature", 0) != 0:
             return
         self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -540,11 +654,12 @@ class LLM:
         path.write_text(json.dumps(reply.raw, ensure_ascii=False), encoding="utf-8")
 
 
-def retry_after(resp: Optional[httpx.Response]) -> Optional[float]:
+def retry_after(resp: httpx.Response | None) -> float | None:
     """Сколько секунд просит подождать провайдер, если он это указал"""
     if resp is None:
         return None
     try:
-        return float(resp.headers.get("retry-after", ""))
+        value = float(resp.headers.get("retry-after", ""))
     except ValueError:
         return None
+    return min(120.0, max(0.0, value)) if math.isfinite(value) else None

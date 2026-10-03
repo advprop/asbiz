@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Ответ по схеме
 
 Просим у модели JSON, проверяем его схемой, а при ошибке возвращаем модели её
@@ -9,11 +8,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
-
-T = TypeVar("T", bound=BaseModel)
 
 
 class StructuredError(Exception):
@@ -26,7 +22,7 @@ class StructuredError(Exception):
         self.attempts, self.last_error, self.last_text = attempts, last_error, last_text
 
 
-def extract_json(text: str) -> Dict[str, Any]:
+def extract_json(text: str) -> dict[str, object]:
     """Первый объект JSON в тексте, даже если вокруг него слова или ограда ```"""
     start = text.find("{")
     if start < 0:
@@ -69,15 +65,15 @@ def _complaint(err: Exception) -> str:
     )
 
 
-def structured(
-    llm: Any,
-    messages: List[dict],
-    schema: Type[T],
+def structured[T: BaseModel](
+    llm: object,
+    messages: list[dict],
+    schema: type[T],
     *,
-    context: Optional[dict] = None,
+    context: dict | None = None,
     max_attempts: int = 3,
-    **kw: Any,
-) -> Tuple[T, int]:
+    **kw: object,
+) -> tuple[T, int]:
     """Ответ модели по схеме и число попыток
 
     Если за max_attempts попыток ответ не прошёл проверку, бросает StructuredError
@@ -98,16 +94,16 @@ def structured(
     raise StructuredError(max_attempts, format_errors(err), text)
 
 
-async def astructured(
-    llm: Any,
-    messages: List[dict],
-    schema: Type[T],
+async def astructured[T: BaseModel](
+    llm: object,
+    messages: list[dict],
+    schema: type[T],
     *,
-    context: Optional[dict] = None,
+    context: dict | None = None,
     max_attempts: int = 3,
-    **kw: Any,
-) -> Tuple[T, int]:
-    """То же, что structured, но асинхронно"""
+    **kw: object,
+) -> tuple[T, int]:
+    """Проверяет ответ модели и просит исправить неверный JSON."""
     history = list(messages)
     err: Exception = ValueError("не было ни одной попытки")
     text = ""

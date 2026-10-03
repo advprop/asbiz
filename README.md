@@ -10,12 +10,10 @@
 
 ## Как запустить
 
-Нужен Python 3.9 или новее.
+Нужны `uv` и личный ключ шлюза курса. Проект использует Python 3.13.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 cp .env.example .env
 ```
 
@@ -24,14 +22,35 @@ cp .env.example .env
 файл `.env` уже в `.gitignore`.
 
 У ключа есть и лимит 10 запросов в минуту. Клиент сам выдерживает паузы по
-строке `LLM_RPM=10` в `.env`, поэтому замер трёх кандидатов на 30 обращениях
-идёт около девяти минут, а задержка в таблице считается без ожидания.
+строке `LLM_RPM=10` в `.env`, поэтому замер четырёх кандидатов на 30 обращениях
+идёт около двенадцати минут, а задержка в таблице считается без ожидания.
 
 Тесты работают без ключа и без сети:
 
 ```bash
-python -m pytest tests
+uv run pytest tests
+uv run ty check
+uv run ruff check .
+uv run ruff format --check .
 ```
+
+`ty` проверяет код двух домашних заданий и инструменты замера, `ruff` проверяет
+все файлы Python.
+
+Профиль памяти одного короткого прогона:
+
+```bash
+mkdir -p runs
+LLM_CACHE_DIR= uv run memray run -f -o runs/escalation.bin -m desk.escalation --split dev --n 5
+uv run memray stats runs/escalation.bin
+uv run memray stats --json -f -o runs/escalation.json runs/escalation.bin
+uv run memray flamegraph -f --no-web -o runs/escalation.html runs/escalation.bin
+uv run python tools/memory_chart.py runs/escalation.json assets/memory.png
+uv run python -m tools.leak_probe
+```
+
+Трасса и интерактивный график остаются в `runs/`. Для сравнения памяти
+нескольких запусков используйте одинаковое число обращений и настройки.
 
 ## Как получить новый семинар
 
@@ -65,15 +84,15 @@ git pull upstream main
   первого токена.
 - Проверили, как положение даты в постановке влияет на кэш у провайдера
   (`3_prefix_cache.py`).
-- Сравнили на 30 обращениях три способа поставить модели задачу: короткую
-  постановку, постановку с правилами и те же правила с рассуждением
+- Сравнили на 30 обращениях четыре способа поставить модели задачу: короткую
+  постановку, постановку с правилами, те же правила с рассуждением и с примерами
   (`desk/bench.py`). Выбор кандидата записывается по шаблону
   `выбор_шаблон.md`.
 
 ```bash
-python 1_raw_request.py
-python 3_prefix_cache.py
-python -m desk.bench --n 30
+uv run python 1_raw_request.py
+uv run python 3_prefix_cache.py
+uv run python -m desk.bench --n 30
 ```
 
 Домашнее задание: [дз_1.md](дз_1.md).
@@ -86,4 +105,3 @@ python -m desk.bench --n 30
 Задание: [задание.md](задание.md).
 
 Домашнее задание: [дз_2.md](дз_2.md).
-

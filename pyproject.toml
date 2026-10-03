@@ -1,7 +1,31 @@
 [project]
 name = "desk"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.13.5,<3",
+    "rank-bm25>=0.2.2",
+    "numpy>=2.3",
+]
+
+[dependency-groups]
+dev = [
+    "memray>=1.20.0",
+    "pillow>=12.3.0",
+    "pytest>=8",
+    "ruff>=0.16.10",
+    "ty>=0.0.81",
+]
+
+[tool.ty.src]
+include = ["desk/batch.py", "desk/bench.py", "desk/escalation.py", "tools"]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP006", "UP045"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

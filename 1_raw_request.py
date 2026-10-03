@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Раунд 1. Запрос к модели без обёртки
 
     python 1_raw_request.py
@@ -12,12 +11,11 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional
 
 import httpx
 
 from desk.config import Settings, settings
-from desk.llm import RateLimit
+from desk.llm import MAX_RESPONSE_BYTES, READ_CHUNK_BYTES, RateLimit
 
 SYSTEM = (
     "Отнеси обращение в поддержку платёжного сервиса к одной категории: платежи, "
@@ -25,7 +23,6 @@ SYSTEM = (
 )
 TICKET = "с меня два раза сняли 3490 за один заказ!!! разберитесь"
 
-# Одна и та же фраза по-русски и по-английски
 PAIRS = [
     (
         "Возврат на карту занимает от трёх до десяти рабочих дней "
@@ -40,7 +37,7 @@ PAIRS = [
 ]
 
 
-def headers(cfg: Settings) -> Dict[str, str]:
+def headers(cfg: Settings) -> dict[str, str]:
     """Заголовки запроса: версия формата, тип содержимого и ключ"""
     out = {"anthropic-version": "2023-06-01", "content-type": "application/json"}
     if cfg.auth_scheme == "bearer":
@@ -52,15 +49,15 @@ def headers(cfg: Settings) -> Dict[str, str]:
 
 def body(
     cfg: Settings,
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, object]],
     *,
-    system: Optional[str] = None,
+    system: str | None = None,
     max_tokens: int = 64,
     temperature: float = 0.0,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Тело запроса к модели"""
-    out: Dict[str, Any] = {
+    out: dict[str, object] = {
         "model": cfg.model,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -74,8 +71,8 @@ def body(
 
 
 def send(
-    cfg: Settings, payload: Dict[str, Any], client: Optional[httpx.Client] = None
-) -> Dict[str, Any]:
+    cfg: Settings, payload: dict[str, object], client: httpx.Client | None = None
+) -> dict[str, object]:
     """Отправляет запрос и возвращает ответ шлюза
 
     Если код ответа не 200, бросает ошибку с текстом ответа. Тесты
@@ -84,25 +81,39 @@ def send(
     own = client is None
     client = client or httpx.Client(timeout=cfg.timeout_s, verify=cfg.verify_ssl)
     try:
-        resp = client.post(
-            cfg.base_url + "/v1/messages", headers=headers(cfg), json=payload
-        )
+        started = time.monotonic()
+        with client.stream(
+            "POST", cfg.base_url + "/v1/messages", headers=headers(cfg), json=payload
+        ) as resp:
+            chunks = []
+            size = 0
+            for chunk in resp.iter_bytes(chunk_size=READ_CHUNK_BYTES):
+                if time.monotonic() - started > 2 * cfg.timeout_s:
+                    raise RuntimeError("общее время запроса истекло")
+                size += len(chunk)
+                if size > MAX_RESPONSE_BYTES:
+                    raise RuntimeError("ответ шлюза превысил допустимый размер")
+                chunks.append(chunk)
+            content = b"".join(chunks)
+            status = resp.status_code
     finally:
         if own:
             client.close()
-    if resp.status_code != 200:
-        raise RuntimeError("шлюз ответил %d: %s" % (resp.status_code, resp.text[:300]))
-    return resp.json()
+    if status != 200:
+        raise RuntimeError(
+            "шлюз ответил %d: %s" % (status, content[:300].decode(errors="replace"))
+        )
+    return json.loads(content)
 
 
-def text_of(resp: Dict[str, Any]) -> str:
+def text_of(resp: dict[str, object]) -> str:
     """Текст ответа из всех блоков text"""
     return "".join(
         b.get("text", "") for b in resp.get("content") or [] if b.get("type") == "text"
     ).strip()
 
 
-def user(text: str) -> List[Dict[str, Any]]:
+def user(text: str) -> list[dict[str, object]]:
     """Сообщение пользователя"""
     return [{"role": "user", "content": text}]
 
@@ -113,7 +124,7 @@ def main() -> None:
         raise SystemExit("впишите LLM_BASE_URL и LLM_API_KEY в .env")
     limit = RateLimit(cfg.rpm)
 
-    def call(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def call(payload: dict[str, object]) -> dict[str, object]:
         """Отправка с паузой, если у ключа лимит запросов в минуту"""
         time.sleep(limit.reserve())
         return send(cfg, payload)

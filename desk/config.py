@@ -1,12 +1,11 @@
-# -*- coding: utf-8 -*-
 """Настройки проекта. Всё, что зависит от окружения, читается здесь"""
+
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -42,10 +41,10 @@ class Settings:
     weight_cache: float = 0.1
     weight_cache_write: float = 1.25
     # Добавка к каждому запросу. По умолчанию выключает рассуждение
-    extra_body: Dict[str, Any] = field(
+    extra_body: dict[str, object] = field(
         default_factory=lambda: {"thinking": {"type": "disabled"}}
     )
-    cache_dir: Optional[Path] = None
+    cache_dir: Path | None = None
 
 
 def settings() -> Settings:

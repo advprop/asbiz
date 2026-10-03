@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Потоковая выдача
 
 С "stream": true шлюз присылает ответ по кусочкам, событиями. Событие
@@ -22,10 +21,40 @@
 from __future__ import annotations
 
 import json
+from codecs import getincrementaldecoder
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
 
 from .llm import LLMError, Usage
+
+
+class LineBuffer:
+    """Собирает строки UTF 8 с пределом на весь поток."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.size = 0
+        self.decoder = getincrementaldecoder("utf-8")()
+        self.pending = ""
+
+    def feed(self, chunk: bytes) -> list[str]:
+        self.size += len(chunk)
+        if self.size > self.limit:
+            raise LLMError("поток превысил допустимый размер")
+        try:
+            self.pending += self.decoder.decode(chunk)
+        except UnicodeDecodeError as error:
+            raise LLMError("поток содержит неверный UTF 8") from error
+        lines = self.pending.split("\n")
+        self.pending = lines.pop()
+        return [line.removesuffix("\r") for line in lines]
+
+    def finish(self) -> list[str]:
+        try:
+            self.pending += self.decoder.decode(b"", final=True)
+        except UnicodeDecodeError as error:
+            raise LLMError("поток содержит неверный UTF 8") from error
+        return [self.pending] if self.pending else []
 
 
 @dataclass
@@ -35,7 +64,7 @@ class StreamResult:
     text: str
     stop_reason: str
     usage: Usage
-    ttft_s: Optional[float]  # до первого слова; None, если текста нет
+    ttft_s: float | None  # до первого слова; None, если текста нет
     total_s: float  # до конца потока
     thinking_chars: int = 0  # длина рассуждения в символах
 
@@ -45,19 +74,29 @@ class StreamResult:
         return self.stop_reason == "max_tokens"
 
 
-def iter_sse(lines: Iterable[str]) -> Iterator[Tuple[str, Dict[str, Any]]]:
+def iter_sse(lines: Iterable[str]) -> Iterator[tuple[str, dict[str, object]]]:
     """Разбирает строки потока на события: имя и данные
 
     Событие кончается пустой строкой. Несколько строк data одного события
     склеиваются. Строка с двоеточием в начале это комментарий
     """
-    event: Optional[str] = None
+    event: str | None = None
     data = []
+
+    def decode() -> dict[str, object]:
+        try:
+            value = json.loads("\n".join(data))
+        except ValueError as e:
+            raise LLMError("неверный JSON в потоке") from e
+        if not isinstance(value, dict):
+            raise LLMError("неверное событие в потоке")
+        return value
+
     for raw in lines:
         line = raw.rstrip("\r\n")
         if not line:
             if data:
-                yield event or "message", json.loads("\n".join(data))
+                yield event or "message", decode()
             event, data = None, []
             continue
         if line.startswith(":"):
@@ -70,14 +109,14 @@ def iter_sse(lines: Iterable[str]) -> Iterator[Tuple[str, Dict[str, Any]]]:
         elif field == "data":
             data.append(value)
     if data:
-        yield event or "message", json.loads("\n".join(data))
+        yield event or "message", decode()
 
 
 def collect(
-    events: Iterable[Tuple[str, Dict[str, Any]]],
+    events: Iterable[tuple[str, dict[str, object]]],
     clock: Callable[[], float],
     started: float,
-    usage_from: Callable[[Dict[str, Any], float, int], Usage],
+    usage_from: Callable[[dict[str, object], float, int], Usage],
     retries: int = 0,
 ) -> StreamResult:
     """Собирает ответ из событий
@@ -85,28 +124,29 @@ def collect(
     Текст склеивается из кусочков, время до первого слова засекается
     на первом кусочке текста. Событие error обрывает сбор
     """
-    usage_raw: Dict[str, Any] = {}
+    usage_raw: dict[str, object] = {}
     parts, ttft, stop, thinking = [], None, "end_turn", 0
     for name, data in events:
         kind = data.get("type", name)
-        if kind == "message_start":
-            usage_raw.update((data.get("message") or {}).get("usage") or {})
-        elif kind == "content_block_delta":
-            delta = data.get("delta") or {}
-            if delta.get("type") == "text_delta":
-                if ttft is None:
-                    ttft = clock() - started
-                parts.append(delta.get("text", ""))
-            elif delta.get("type") == "thinking_delta":
-                thinking += len(delta.get("thinking", ""))
-        elif kind == "message_delta":
-            stop = (data.get("delta") or {}).get("stop_reason") or stop
-            usage_raw.update(data.get("usage") or {})
-        elif kind == "error":
-            err = data.get("error") or {}
-            raise LLMError(
-                "поток прерван: %s %s" % (err.get("type"), err.get("message", ""))
-            )
+        match kind:
+            case "message_start":
+                usage_raw.update((data.get("message") or {}).get("usage") or {})
+            case "content_block_delta":
+                delta = data.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    if ttft is None:
+                        ttft = clock() - started
+                    parts.append(delta.get("text", ""))
+                elif delta.get("type") == "thinking_delta":
+                    thinking += len(delta.get("thinking", ""))
+            case "message_delta":
+                stop = (data.get("delta") or {}).get("stop_reason") or stop
+                usage_raw.update(data.get("usage") or {})
+            case "error":
+                err = data.get("error") or {}
+                raise LLMError(
+                    "поток прерван: %s %s" % (err.get("type"), err.get("message", ""))
+                )
     total = clock() - started
     usage = usage_from(usage_raw, total, retries)
     return StreamResult("".join(parts).strip(), stop, usage, ttft, total, thinking)
