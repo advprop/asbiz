@@ -45,11 +45,11 @@ LLM_CACHE_DIR= uv run memray run -f -o runs/escalation.bin -m desk.escalation --
 uv run memray stats runs/escalation.bin
 uv run memray stats --json -f -o runs/escalation.json runs/escalation.bin
 uv run memray flamegraph -f --no-web -o runs/escalation.html runs/escalation.bin
-uv run python tools/memory_chart.py runs/escalation.json assets/memory.png
 uv run python -m tools.leak_probe
 ```
 
-Трасса и интерактивный график остаются в `runs/`. Для сравнения памяти
+Трасса и интерактивный flamegraph остаются в `runs/`. PNG в отчёте снят с
+flamegraph в режиме `Flames` при тройном масштабе. Для сравнения памяти
 нескольких запусков используйте одинаковое число обращений и настройки.
 
 ## Как получить новый семинар
